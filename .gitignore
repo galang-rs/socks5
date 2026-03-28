@@ -1,0 +1,11 @@
+*.pem
+*.ovpn
+*.txt
+*.exe
+*/bin/
+*.txt
+*.conf
+*.ovpn
+*.pem
+*.key
+*.crt
