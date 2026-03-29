@@ -155,6 +155,10 @@ func (s *Stack) Close() error {
 		s.cancel()
 	}
 
+	// Force-close the TUN device to unblock readLoop's blocking tun.Read().
+	// TUN devices have closeOnce protection, so double-close is safe.
+	s.tun.Close()
+
 	// Close all TCP connections.
 	s.connMu.Lock()
 	for _, c := range s.conns {

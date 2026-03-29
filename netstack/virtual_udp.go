@@ -156,17 +156,23 @@ func (c *VirtualUDPConn) RemoteAddr() net.Addr {
 }
 
 func (c *VirtualUDPConn) SetDeadline(t time.Time) error {
+	c.mu.Lock()
 	c.readDeadline = t
 	c.writeDeadline = t
+	c.mu.Unlock()
 	return nil
 }
 
 func (c *VirtualUDPConn) SetReadDeadline(t time.Time) error {
+	c.mu.Lock()
 	c.readDeadline = t
+	c.mu.Unlock()
 	return nil
 }
 
 func (c *VirtualUDPConn) SetWriteDeadline(t time.Time) error {
+	c.mu.Lock()
 	c.writeDeadline = t
+	c.mu.Unlock()
 	return nil
 }

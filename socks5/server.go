@@ -88,10 +88,12 @@ type Server struct {
 	udpConn  *net.UDPConn
 	udpFlows sync.Map // key: string(clientAddr) -> *udpRelay
 	mu       sync.Mutex
+	wg       sync.WaitGroup // tracks active goroutines for graceful shutdown
 }
 
 // udpRelay tracks a single client's UDP association.
 type udpRelay struct {
+	mu         sync.Mutex     // protects clientAddr
 	clientAddr *net.UDPAddr
 	flows      sync.Map // key: string(targetAddr) -> net.Conn (tunnel UDP conn)
 	cancel     context.CancelFunc
@@ -175,14 +177,19 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 		udpConn.Close()
 	}()
 
-	// Start UDP relay loop.
-	go s.udpRelayLoop(ctx)
+	// Start UDP relay loop (tracked).
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		s.udpRelayLoop(ctx)
+	}()
 
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			select {
 			case <-ctx.Done():
+				s.wg.Wait() // wait for all active goroutines to finish
 				return nil
 			default:
 				s.logger.Errorf("accept: %v", err)
@@ -190,7 +197,11 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 			}
 		}
 
-		go s.handleConn(ctx, conn)
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			s.handleConn(ctx, conn)
+		}()
 	}
 }
 
@@ -204,17 +215,21 @@ func (s *Server) Addr() net.Addr {
 	return nil
 }
 
-// Close stops the SOCKS5 server.
+// Close stops the SOCKS5 server and waits for active goroutines to finish.
 func (s *Server) Close() error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.udpConn != nil {
 		s.udpConn.Close()
 	}
+	var err error
 	if s.listener != nil {
-		return s.listener.Close()
+		err = s.listener.Close()
 	}
-	return nil
+	s.mu.Unlock()
+
+	// Wait for all active goroutines (handleConn, udpRelayLoop, etc.)
+	s.wg.Wait()
+	return err
 }
 
 // --- connection handling ---
@@ -396,8 +411,8 @@ func (s *Server) handleConnect(ctx context.Context, conn net.Conn, addr string) 
 		s.sendReply(conn, repSuccess, nil)
 	}
 
-	// Bidirectional relay.
-	s.relay(conn, target)
+	// Bidirectional relay (context-aware, force-closeable).
+	s.relay(ctx, conn, target)
 	return nil
 }
 
@@ -456,6 +471,14 @@ func (s *Server) handleUDPAssociate(ctx context.Context, conn net.Conn, clientHi
 		})
 		s.udpFlows.Delete(clientUDPKey)
 		s.logger.Infof("UDP ASSOCIATE: cleaned up relay for %s", clientHost)
+	}()
+
+	// Force-close the TCP conn when context is cancelled so io.Copy unblocks.
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		<-relayCtx.Done()
+		conn.Close()
 	}()
 
 	// Block until TCP control connection closes or context is cancelled.
@@ -545,7 +568,9 @@ func (s *Server) udpRelayLoop(ctx context.Context) {
 		relay := relayVal.(*udpRelay)
 
 		// Update the client's actual UDP address (port may vary).
+		relay.mu.Lock()
 		relay.clientAddr = clientAddr
+		relay.mu.Unlock()
 
 		// Get or create tunnel connection for this target.
 		var tunnelConn net.Conn
@@ -566,7 +591,11 @@ func (s *Server) udpRelayLoop(ctx context.Context) {
 			relay.flows.Store(targetAddr, tunnelConn)
 
 			// Start goroutine to read replies from tunnel and send back to client.
-			go s.udpReplyLoop(ctx, relay, tunnelConn, targetAddr)
+			s.wg.Add(1)
+			go func() {
+				defer s.wg.Done()
+				s.udpReplyLoop(ctx, relay, tunnelConn, targetAddr)
+			}()
 		}
 
 		// Forward payload to tunnel.
@@ -589,6 +618,14 @@ func (s *Server) udpReplyLoop(ctx context.Context, relay *udpRelay, tunnelConn n
 		relay.flows.Delete(targetAddr)
 	}()
 
+	// Force-close tunnelConn when context is cancelled to unblock Read.
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		<-ctx.Done()
+		tunnelConn.Close()
+	}()
+
 	s.logger.Infof("UDP REPLY: starting reply loop for %s", targetAddr)
 	buf := make([]byte, maxUDPPacket)
 	for {
@@ -605,7 +642,12 @@ func (s *Server) udpReplyLoop(ctx context.Context, relay *udpRelay, tunnelConn n
 			return
 		}
 
-		s.logger.Infof("UDP REPLY: got %d bytes from %s, sending to client %s", n, targetAddr, relay.clientAddr)
+		// Read clientAddr under lock.
+		relay.mu.Lock()
+		clientAddr := relay.clientAddr
+		relay.mu.Unlock()
+
+		s.logger.Infof("UDP REPLY: got %d bytes from %s, sending to client %s", n, targetAddr, clientAddr)
 
 		// Build SOCKS5 UDP datagram response.
 		host, portStr, _ := net.SplitHostPort(targetAddr)
@@ -634,9 +676,9 @@ func (s *Server) udpReplyLoop(ctx context.Context, relay *udpRelay, tunnelConn n
 		// Combine header + payload.
 		datagram := append(header, buf[:n]...)
 
-		if relay.clientAddr != nil {
-			nn, err := s.udpConn.WriteToUDP(datagram, relay.clientAddr)
-			s.logger.Infof("UDP REPLY: sent %d bytes to client %s (err=%v)", nn, relay.clientAddr, err)
+		if clientAddr != nil {
+			nn, err := s.udpConn.WriteToUDP(datagram, clientAddr)
+			s.logger.Infof("UDP REPLY: sent %d bytes to client %s (err=%v)", nn, clientAddr, err)
 		}
 	}
 }
@@ -788,24 +830,34 @@ func (s *Server) sendReply(conn net.Conn, rep byte, bindAddr net.Addr) {
 }
 
 // relay copies data bidirectionally between two connections.
-func (s *Server) relay(client, target net.Conn) {
+// It is context-aware: when ctx is cancelled, both connections are
+// force-closed to unblock any in-progress io.Copy calls.
+func (s *Server) relay(ctx context.Context, client, target net.Conn) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	var wg sync.WaitGroup
-	wg.Add(2)
+	wg.Add(3) // 2 copy goroutines + 1 force-close sentinel
+
+	// Force-close both connections when context is cancelled,
+	// which unblocks any blocking io.Copy calls.
+	go func() {
+		defer wg.Done()
+		<-ctx.Done()
+		client.Close()
+		target.Close()
+	}()
 
 	go func() {
 		defer wg.Done()
 		io.Copy(target, client)
-		if tc, ok := target.(*net.TCPConn); ok {
-			tc.CloseWrite()
-		}
+		cancel() // signal the other direction to stop
 	}()
 
 	go func() {
 		defer wg.Done()
 		io.Copy(client, target)
-		if tc, ok := client.(*net.TCPConn); ok {
-			tc.CloseWrite()
-		}
+		cancel() // signal the other direction to stop
 	}()
 
 	wg.Wait()

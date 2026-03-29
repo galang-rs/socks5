@@ -355,18 +355,24 @@ func (c *VirtualConn) RemoteAddr() net.Addr {
 }
 
 func (c *VirtualConn) SetDeadline(t time.Time) error {
+	c.mu.Lock()
 	c.readDeadline = t
 	c.writeDeadline = t
+	c.mu.Unlock()
 	return nil
 }
 
 func (c *VirtualConn) SetReadDeadline(t time.Time) error {
+	c.mu.Lock()
 	c.readDeadline = t
+	c.mu.Unlock()
 	return nil
 }
 
 func (c *VirtualConn) SetWriteDeadline(t time.Time) error {
+	c.mu.Lock()
 	c.writeDeadline = t
+	c.mu.Unlock()
 	return nil
 }
 
