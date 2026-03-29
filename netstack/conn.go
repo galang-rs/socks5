@@ -341,8 +341,15 @@ func (c *VirtualConn) Close() error {
 
 	c.closeOnce.Do(func() { close(c.closeCh) })
 
-	// Unregister from stack.
+	// Unregister from stack and free resources.
 	c.stack.removeConn(c.key())
+	c.stack.freePort(c.localPort)
+
+	// Clear receive buffer to release memory.
+	c.mu.Lock()
+	c.recvBuf.Reset()
+	c.mu.Unlock()
+
 	return nil
 }
 

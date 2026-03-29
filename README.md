@@ -13,7 +13,7 @@
 </p>
 
 <p align="center">
-  <em>Full RFC 1928 (CONNECT) and RFC 1929 (username/password auth) implementation — with pluggable VPN backends, multi-credential authentication, and a custom lightweight userspace TCP/IP stack for tunnel connectivity. No gVisor dependency.</em>
+  <em>Full RFC 1928 (CONNECT + UDP ASSOCIATE) and RFC 1929 (username/password auth) implementation — with pluggable VPN backends, multi-credential authentication, leveled logging, and a custom lightweight userspace TCP/IP stack for tunnel connectivity. No gVisor dependency.</em>
 </p>
 
 ---
@@ -21,11 +21,12 @@
 ## ✨ Features
 
 ### 🛡️ Full SOCKS5 Protocol
-- **RFC 1928 Compliance** — Complete SOCKS5 CONNECT command implementation
+- **RFC 1928 Compliance** — Complete SOCKS5 CONNECT and UDP ASSOCIATE implementation
 - **RFC 1929 Authentication** — Username/password authentication support
 - **Method Negotiation** — Proper SOCKS5 auth method negotiation handshake
+- **UDP Relay** — Full UDP ASSOCIATE with datagram encapsulation/decapsulation through VPN tunnels
 - **Error Handling** — Standard SOCKS5 reply codes for all error conditions
-- **Graceful Shutdown** — Context-aware server with clean connection teardown
+- **Graceful Shutdown** — Context-aware server with clean connection teardown and goroutine tracking
 
 ### 🔐 Multi-Credential Authentication
 - **Multiple Passwords Per User** — Same username can authenticate with different passwords
@@ -43,12 +44,21 @@
 - **Lightweight TCP/IP Stack** — Userspace network stack for VPN tunnel I/O
 - **DNS Resolution** — Sends DNS queries as UDP packets through the tunnel
 - **TCP Handshake** — Full 3-way handshake via raw IP packets over TUN
+- **Virtual UDP** — Connected UDP connections routed through the tunnel with backpressure
 - **Data Relay** — TCP segmentation and reassembly through the tunnel
 - **Connection Teardown** — Proper FIN/ACK sequence for clean disconnects
+- **Memory Management** — Automatic port reclamation, buffer cleanup, and channel draining on close
 - **Zero gVisor Dependency** — Custom implementation, no heavy external stacks
 
+### 📊 Leveled Logging
+- **5 Log Levels** — `Disabled`, `Error`, `Warn`, `Info`, `Debug`
+- **Production Ready** — Default `Warn` level silences verbose packet traces
+- **Debug Mode** — `LogLevelDebug` enables full per-packet UDP relay tracing
+- **Custom Logger** — Implement the `Logger` interface for custom log backends
+- **Per-Level Prefixes** — `[SOCKS5]`, `[SOCKS5:WARN]`, `[SOCKS5:ERR]`, `[SOCKS5:DBG]`
+
 ### ⚙️ Architecture
-- **Functional Options Pattern** — `socks5.WithAddr()`, `socks5.WithAuth()`, `socks5.WithBackend()`
+- **Functional Options Pattern** — `socks5.WithAddr()`, `socks5.WithAuth()`, `socks5.WithBackend()`, `socks5.WithLogLevel()`
 - **Modular Package Design** — Separated `auth`, `backend`, `netstack`, `socks5` packages
 - **Concurrent Connection Handling** — Each SOCKS5 connection handled in its own goroutine
 - **Context-Aware** — Full `context.Context` support for cancellation and timeouts
@@ -104,10 +114,14 @@ func main() {
     defer be.Close()
 
     // Start SOCKS5 proxy
+    // LogLevelWarn  = only warnings and errors (production)
+    // LogLevelInfo  = normal operational logs
+    // LogLevelDebug = verbose packet-level tracing
     srv := socks5.New(
         socks5.WithAddr(":1080"),
         socks5.WithAuth(authenticator),
         socks5.WithBackend(be),
+        socks5.WithLogLevel(socks5.LogLevelWarn),
     )
 
     log.Println("SOCKS5 proxy starting on :1080")
@@ -156,6 +170,38 @@ if err != nil {
 defer be.Close()
 ```
 
+### Log Level Control
+
+```go
+// Production — silent except warnings and errors (default)
+socks5.WithLogLevel(socks5.LogLevelWarn)
+
+// Normal operation — connection logs
+socks5.WithLogLevel(socks5.LogLevelInfo)
+
+// Troubleshooting — full packet-level UDP relay traces
+socks5.WithLogLevel(socks5.LogLevelDebug)
+
+// Completely silent — no output at all
+socks5.WithLogLevel(socks5.LogLevelDisabled)
+```
+
+### Custom Logger
+
+```go
+// Implement the socks5.Logger interface for custom backends
+type myLogger struct{}
+
+func (myLogger) Debugf(format string, args ...any) { /* ... */ }
+func (myLogger) Infof(format string, args ...any)  { /* ... */ }
+func (myLogger) Warnf(format string, args ...any)  { /* ... */ }
+func (myLogger) Errorf(format string, args ...any) { /* ... */ }
+
+srv := socks5.New(
+    socks5.WithLogger(myLogger{}),
+)
+```
+
 ### Running Tests
 
 ```bash
@@ -183,16 +229,15 @@ socks5/
 │   ├── wireguard.go             # WireGuard tunnel backend
 │   └── openvpn.go               # OpenVPN tunnel backend
 ├── netstack/
-│   ├── stack.go                 # Virtual TCP/IP stack controller
-│   ├── conn.go                  # net.Conn implementation over netstack
+│   ├── stack.go                 # Virtual TCP/IP stack controller + Logger interface
+│   ├── conn.go                  # TCP net.Conn implementation over netstack
+│   ├── virtual_udp.go           # UDP net.Conn implementation over netstack
 │   ├── dns.go                   # DNS resolver via UDP over tunnel
 │   ├── ip.go                    # IPv4 packet builder & parser
 │   ├── tcp.go                   # TCP segment builder & parser
 │   └── udp.go                   # UDP datagram builder & parser
 ├── socks5/
-│   └── server.go                # SOCKS5 proxy server (RFC 1928/1929)
-├── test/
-│   └── socks5_test.go           # Integration tests
+│   └── server.go                # SOCKS5 proxy server (RFC 1928/1929) + LogLevel system
 ├── go.mod
 └── go.sum
 ```
@@ -232,7 +277,9 @@ The `netstack` package implements a lightweight virtual TCP/IP stack that bridge
 1. **DNS Resolution** — Sends DNS queries as UDP through the tunnel
 2. **TCP Handshake** — 3-way handshake via raw IP packets
 3. **Data Relay** — Segments TCP data into IP packets through TUN
-4. **Connection Teardown** — Proper FIN/ACK sequence
+4. **UDP Relay** — Virtual connected UDP for datagram forwarding
+5. **Connection Teardown** — Proper FIN/ACK sequence
+6. **Resource Cleanup** — Automatic port reclamation, buffer reset, and channel draining
 
 ---
 

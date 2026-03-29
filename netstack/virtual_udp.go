@@ -144,7 +144,14 @@ func (c *VirtualUDPConn) Close() error {
 	c.stack.removeUDPConn(c.key())
 	c.stack.freePort(c.localPort)
 
-	return nil
+	// Drain receive channel to free buffered datagrams.
+	for {
+		select {
+		case <-c.recvCh:
+		default:
+			return nil
+		}
+	}
 }
 
 func (c *VirtualUDPConn) LocalAddr() net.Addr {

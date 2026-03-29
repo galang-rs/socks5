@@ -20,8 +20,12 @@ type WireGuardConfig struct {
 	// If empty, uses DNS from the WireGuard config, or 1.1.1.1 as fallback.
 	DNSServers []string
 
-	// Logger for debug output. If nil, logging is disabled.
+	// Logger for netstack debug output. If nil, logging is disabled.
 	Logger netstack.Logger
+
+	// LogLevel controls the verbosity of WireGuard tunnel internal logs.
+	// 0 = warn only (default), 1 = info, 2 = debug.
+	LogLevel int
 }
 
 type wireGuardBackend struct {
@@ -43,7 +47,10 @@ func NewWireGuard(ctx context.Context, cfg WireGuardConfig) (Backend, error) {
 	}
 
 	// Parse WireGuard config.
-	wgCfg := wgconfig.NewConfig(wgconfig.WithConfigFile(cfg.ConfigFile))
+	wgCfg := wgconfig.NewConfig(
+		wgconfig.WithConfigFile(cfg.ConfigFile),
+		wgconfig.WithLogger(newWGLogger(cfg.LogLevel)),
+	)
 
 	// Start WireGuard tunnel.
 	dialer := &net.Dialer{}

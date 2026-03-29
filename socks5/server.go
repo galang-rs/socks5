@@ -67,16 +67,57 @@ const (
 	repAtypNotSupported = 0x08
 )
 
+// LogLevel controls the verbosity of log output.
+type LogLevel int
+
+const (
+	// LogLevelDisabled disables all logging.
+	LogLevelDisabled LogLevel = iota
+	// LogLevelError logs only errors.
+	LogLevelError
+	// LogLevelWarn logs warnings and errors.
+	LogLevelWarn
+	// LogLevelInfo logs info, warnings, and errors.
+	LogLevelInfo
+	// LogLevelDebug logs everything including verbose debug messages.
+	LogLevelDebug
+)
+
 // Logger interface for the SOCKS5 server.
 type Logger interface {
+	Debugf(format string, args ...any)
 	Infof(format string, args ...any)
+	Warnf(format string, args ...any)
 	Errorf(format string, args ...any)
 }
 
-type stdLogger struct{}
+type stdLogger struct {
+	level LogLevel
+}
 
-func (stdLogger) Infof(format string, args ...any)  { log.Printf("[SOCKS5] "+format, args...) }
-func (stdLogger) Errorf(format string, args ...any) { log.Printf("[SOCKS5:ERR] "+format, args...) }
+func (l stdLogger) Debugf(format string, args ...any) {
+	if l.level >= LogLevelDebug {
+		log.Printf("[SOCKS5:DBG] "+format, args...)
+	}
+}
+
+func (l stdLogger) Infof(format string, args ...any) {
+	if l.level >= LogLevelInfo {
+		log.Printf("[SOCKS5] "+format, args...)
+	}
+}
+
+func (l stdLogger) Warnf(format string, args ...any) {
+	if l.level >= LogLevelWarn {
+		log.Printf("[SOCKS5:WARN] "+format, args...)
+	}
+}
+
+func (l stdLogger) Errorf(format string, args ...any) {
+	if l.level >= LogLevelError {
+		log.Printf("[SOCKS5:ERR] "+format, args...)
+	}
+}
 
 // Server is a SOCKS5 proxy server.
 type Server struct {
@@ -107,7 +148,7 @@ func New(opts ...Option) *Server {
 	s := &Server{
 		addr:    "127.0.0.1:1080",
 		backend: backend.NewDirect(),
-		logger:  stdLogger{},
+		logger:  stdLogger{level: LogLevelInfo},
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -134,6 +175,14 @@ func WithBackend(b backend.Backend) Option {
 // WithLogger sets a custom logger.
 func WithLogger(l Logger) Option {
 	return func(s *Server) { s.logger = l }
+}
+
+// WithLogLevel sets the log level for the default logger.
+// Use LogLevelDisabled to disable all output, LogLevelWarn for warnings
+// and errors only, LogLevelInfo for normal output, or LogLevelDebug
+// for verbose troubleshooting.
+func WithLogLevel(level LogLevel) Option {
+	return func(s *Server) { s.logger = stdLogger{level: level} }
 }
 
 // ListenAndServe starts the SOCKS5 server and blocks until the context is cancelled.
@@ -523,7 +572,7 @@ func (s *Server) udpRelayLoop(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			default:
-				s.logger.Errorf("UDP read: %v", err)
+				s.logger.Warnf("UDP read: %v", err)
 				continue
 			}
 		}
@@ -550,19 +599,19 @@ func (s *Server) udpRelayLoop(ctx context.Context) {
 		// Parse target address.
 		targetAddr, headerLen, err := parseSocks5UDPAddr(data)
 		if err != nil {
-			s.logger.Errorf("UDP parse addr: %v", err)
+			s.logger.Warnf("UDP parse addr: %v", err)
 			continue
 		}
 
 		payload := data[headerLen:]
 
-		s.logger.Infof("UDP RELAY: %s → %s (%d bytes payload)", clientAddr, targetAddr, len(payload))
+		s.logger.Debugf("UDP RELAY: %s → %s (%d bytes payload)", clientAddr, targetAddr, len(payload))
 
 		// Find the relay for this client.
 		clientKey := normalizeIP(clientAddr.IP.String())
 		relayVal, ok := s.udpFlows.Load(clientKey)
 		if !ok {
-			s.logger.Errorf("UDP: no association for client %s", clientKey)
+			s.logger.Warnf("UDP: no association for client %s", clientKey)
 			continue
 		}
 		relay := relayVal.(*udpRelay)
@@ -578,7 +627,7 @@ func (s *Server) udpRelayLoop(ctx context.Context) {
 			tunnelConn = v.(net.Conn)
 		} else {
 			// Dial through the tunnel backend.
-			s.logger.Infof("UDP RELAY: dialing tunnel to %s", targetAddr)
+			s.logger.Debugf("UDP RELAY: dialing tunnel to %s", targetAddr)
 			dialCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 			tc, err := s.backend.DialContext(dialCtx, "udp", targetAddr)
 			cancel()
@@ -586,7 +635,7 @@ func (s *Server) udpRelayLoop(ctx context.Context) {
 				s.logger.Errorf("UDP tunnel dial %s: %v", targetAddr, err)
 				continue
 			}
-			s.logger.Infof("UDP RELAY: tunnel connected to %s", targetAddr)
+			s.logger.Debugf("UDP RELAY: tunnel connected to %s", targetAddr)
 			tunnelConn = tc
 			relay.flows.Store(targetAddr, tunnelConn)
 
@@ -600,11 +649,11 @@ func (s *Server) udpRelayLoop(ctx context.Context) {
 
 		// Forward payload to tunnel.
 		if _, err := tunnelConn.Write(payload); err != nil {
-			s.logger.Errorf("UDP tunnel write: %v", err)
+			s.logger.Warnf("UDP tunnel write: %v", err)
 			tunnelConn.Close()
 			relay.flows.Delete(targetAddr)
 		} else {
-			s.logger.Infof("UDP RELAY: forwarded %d bytes to %s", len(payload), targetAddr)
+			s.logger.Debugf("UDP RELAY: forwarded %d bytes to %s", len(payload), targetAddr)
 		}
 	}
 }
@@ -612,21 +661,26 @@ func (s *Server) udpRelayLoop(ctx context.Context) {
 // udpReplyLoop reads replies from a tunnel UDP connection and sends them
 // back to the SOCKS5 client with proper datagram encapsulation.
 func (s *Server) udpReplyLoop(ctx context.Context, relay *udpRelay, tunnelConn net.Conn, targetAddr string) {
+	// Local cancel ensures the force-close goroutine exits when this function returns,
+	// preventing goroutine leaks if the reply loop ends before the server context.
+	localCtx, localCancel := context.WithCancel(ctx)
+	defer localCancel()
+
 	defer func() {
-		s.logger.Infof("UDP REPLY: loop ended for %s", targetAddr)
+		s.logger.Debugf("UDP REPLY: loop ended for %s", targetAddr)
 		tunnelConn.Close()
 		relay.flows.Delete(targetAddr)
 	}()
 
-	// Force-close tunnelConn when context is cancelled to unblock Read.
+	// Force-close tunnelConn when done to unblock Read.
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
-		<-ctx.Done()
+		<-localCtx.Done()
 		tunnelConn.Close()
 	}()
 
-	s.logger.Infof("UDP REPLY: starting reply loop for %s", targetAddr)
+	s.logger.Debugf("UDP REPLY: starting reply loop for %s", targetAddr)
 	buf := make([]byte, maxUDPPacket)
 	for {
 		select {
@@ -638,7 +692,7 @@ func (s *Server) udpReplyLoop(ctx context.Context, relay *udpRelay, tunnelConn n
 		tunnelConn.SetReadDeadline(time.Now().Add(2 * time.Minute))
 		n, err := tunnelConn.Read(buf)
 		if err != nil {
-			s.logger.Infof("UDP REPLY: read from %s error: %v", targetAddr, err)
+			s.logger.Debugf("UDP REPLY: read from %s: %v", targetAddr, err)
 			return
 		}
 
@@ -647,7 +701,7 @@ func (s *Server) udpReplyLoop(ctx context.Context, relay *udpRelay, tunnelConn n
 		clientAddr := relay.clientAddr
 		relay.mu.Unlock()
 
-		s.logger.Infof("UDP REPLY: got %d bytes from %s, sending to client %s", n, targetAddr, clientAddr)
+		s.logger.Debugf("UDP REPLY: got %d bytes from %s, sending to client %s", n, targetAddr, clientAddr)
 
 		// Build SOCKS5 UDP datagram response.
 		host, portStr, _ := net.SplitHostPort(targetAddr)
@@ -678,7 +732,7 @@ func (s *Server) udpReplyLoop(ctx context.Context, relay *udpRelay, tunnelConn n
 
 		if clientAddr != nil {
 			nn, err := s.udpConn.WriteToUDP(datagram, clientAddr)
-			s.logger.Infof("UDP REPLY: sent %d bytes to client %s (err=%v)", nn, clientAddr, err)
+			s.logger.Debugf("UDP REPLY: sent %d bytes to client %s (err=%v)", nn, clientAddr, err)
 		}
 	}
 }

@@ -22,8 +22,12 @@ type OpenVPNConfig struct {
 	// DNSServers overrides DNS. If empty, defaults to 1.1.1.1.
 	DNSServers []string
 
-	// Logger for debug output. If nil, logging is disabled.
+	// Logger for netstack debug output. If nil, logging is disabled.
 	Logger netstack.Logger
+
+	// LogLevel controls the verbosity of OpenVPN tunnel internal logs.
+	// 0 = warn only (default), 1 = info, 2 = debug.
+	LogLevel int
 }
 
 type openVPNBackend struct {
@@ -48,6 +52,7 @@ func NewOpenVPN(ctx context.Context, cfg OpenVPNConfig) (Backend, error) {
 	// Build options.
 	opts := []ovpnconfig.Option{
 		ovpnconfig.WithConfigFile(cfg.ConfigFile),
+		ovpnconfig.WithLogger(newOVPNLogger(cfg.LogLevel)),
 	}
 	if cfg.AuthFile != "" {
 		opts = append(opts, ovpnconfig.WithAuthFile(cfg.AuthFile))
