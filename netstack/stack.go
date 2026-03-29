@@ -49,8 +49,12 @@ type Stack struct {
 	connMu sync.RWMutex
 	conns  map[connKey]*VirtualConn
 
-	// UDP handlers (for DNS).
-	udpMu      sync.RWMutex
+	// UDP connections (general-purpose).
+	udpConnMu sync.RWMutex
+	udpConns  map[udpConnKey]*VirtualUDPConn
+
+	// UDP handlers (legacy, for DNS resolver).
+	udpMu       sync.RWMutex
 	udpHandlers map[uint16]chan []byte
 
 	// Port allocation.
@@ -128,6 +132,7 @@ func New(cfg StackConfig) (*Stack, error) {
 		dns:         dns,
 		logger:      logger,
 		conns:       make(map[connKey]*VirtualConn),
+		udpConns:    make(map[udpConnKey]*VirtualUDPConn),
 		udpHandlers: make(map[uint16]chan []byte),
 		nextPort:    10000,
 		usedPort:    make(map[uint16]bool),
@@ -150,7 +155,7 @@ func (s *Stack) Close() error {
 		s.cancel()
 	}
 
-	// Close all connections.
+	// Close all TCP connections.
 	s.connMu.Lock()
 	for _, c := range s.conns {
 		c.closeOnce.Do(func() { close(c.closeCh) })
@@ -158,11 +163,19 @@ func (s *Stack) Close() error {
 	s.conns = make(map[connKey]*VirtualConn)
 	s.connMu.Unlock()
 
+	// Close all UDP connections.
+	s.udpConnMu.Lock()
+	for _, c := range s.udpConns {
+		c.closeOnce.Do(func() { close(c.closeCh) })
+	}
+	s.udpConns = make(map[udpConnKey]*VirtualUDPConn)
+	s.udpConnMu.Unlock()
+
 	s.wg.Wait()
 	return nil
 }
 
-// DialContext creates a TCP connection through the tunnel.
+// DialContext creates a TCP or UDP connection through the tunnel.
 // Hostnames are resolved via DNS through the tunnel.
 func (s *Stack) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
 	host, portStr, err := net.SplitHostPort(addr)
@@ -181,15 +194,28 @@ func (s *Stack) DialContext(ctx context.Context, network, addr string) (net.Conn
 		return nil, fmt.Errorf("netstack: resolve %q: %w", host, err)
 	}
 
+	// Branch based on network type.
+	switch network {
+	case "udp", "udp4", "udp6":
+		return s.dialUDP(ctx, host, remoteIP.To4(), uint16(port))
+	case "tcp", "tcp4", "tcp6", "":
+		return s.dialTCP(ctx, host, remoteIP.To4(), uint16(port), addr)
+	default:
+		return nil, fmt.Errorf("netstack: unsupported network %q", network)
+	}
+}
+
+// dialTCP creates a TCP connection through the tunnel.
+func (s *Stack) dialTCP(ctx context.Context, host string, remoteIP net.IP, port uint16, addr string) (net.Conn, error) {
 	localPort := s.allocPort()
-	conn := newVirtualConn(s, s.localIP, localPort, remoteIP.To4(), uint16(port))
+	conn := newVirtualConn(s, s.localIP, localPort, remoteIP, port)
 
 	// Register connection for dispatch.
 	s.connMu.Lock()
 	s.conns[conn.key()] = conn
 	s.connMu.Unlock()
 
-	s.logger.Debugf("dial %s → %s:%d (local port %d)", host, remoteIP, port, localPort)
+	s.logger.Debugf("tcp dial %s → %s:%d (local port %d)", host, remoteIP, port, localPort)
 
 	// TCP handshake.
 	if err := conn.handshake(ctx); err != nil {
@@ -198,7 +224,24 @@ func (s *Stack) DialContext(ctx context.Context, network, addr string) (net.Conn
 		return nil, fmt.Errorf("netstack: connect %s: %w", addr, err)
 	}
 
-	s.logger.Infof("connected %s:%d via tunnel", host, port)
+	s.logger.Infof("tcp connected %s:%d via tunnel", host, port)
+	return conn, nil
+}
+
+// dialUDP creates a UDP connection through the tunnel.
+// No handshake needed — UDP is connectionless. The connection is
+// registered so that reply packets from the remote are delivered.
+func (s *Stack) dialUDP(ctx context.Context, host string, remoteIP net.IP, port uint16) (net.Conn, error) {
+	localPort := s.allocPort()
+	conn := newVirtualUDPConn(s, s.localIP, localPort, remoteIP, port)
+
+	// Register UDP connection for dispatch.
+	s.udpConnMu.Lock()
+	s.udpConns[conn.key()] = conn
+	s.udpConnMu.Unlock()
+
+	s.logger.Debugf("udp dial %s → %s:%d (local port %d)", host, remoteIP, port, localPort)
+	s.logger.Infof("udp ready %s:%d via tunnel", host, port)
 	return conn, nil
 }
 
@@ -297,6 +340,25 @@ func (s *Stack) dispatchUDP(pkt *IPPacket) {
 		return
 	}
 
+	// 1. Try connected UDP connections first (general-purpose UDP).
+	var srcAddr [4]byte
+	copy(srcAddr[:], pkt.SrcIP.To4())
+	udpKey := udpConnKey{
+		localPort:  udpPkt.DstPort,
+		remoteIP:   srcAddr,
+		remotePort: udpPkt.SrcPort,
+	}
+
+	s.udpConnMu.RLock()
+	uconn, ok := s.udpConns[udpKey]
+	s.udpConnMu.RUnlock()
+
+	if ok {
+		uconn.deliver(udpPkt.Payload)
+		return
+	}
+
+	// 2. Fall back to legacy DNS handlers (port-only match).
 	s.udpMu.RLock()
 	ch, ok := s.udpHandlers[udpPkt.DstPort]
 	s.udpMu.RUnlock()
@@ -381,4 +443,10 @@ func (s *Stack) removeConn(key connKey) {
 	s.connMu.Lock()
 	delete(s.conns, key)
 	s.connMu.Unlock()
+}
+
+func (s *Stack) removeUDPConn(key udpConnKey) {
+	s.udpConnMu.Lock()
+	delete(s.udpConns, key)
+	s.udpConnMu.Unlock()
 }

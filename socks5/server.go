@@ -28,6 +28,9 @@ import (
 	"github.com/galang-rs/socks5/backend"
 )
 
+// maxUDPPacket is the maximum UDP datagram size we handle.
+const maxUDPPacket = 65535
+
 // SOCKS5 constants.
 const (
 	socks5Version = 0x05
@@ -43,7 +46,9 @@ const (
 	authFailure         = 0x01
 
 	// Commands.
-	cmdConnect = 0x01
+	cmdConnect      = 0x01
+	cmdBind         = 0x02
+	cmdUDPAssociate = 0x03
 
 	// Address types.
 	atypIPv4   = 0x01
@@ -80,7 +85,16 @@ type Server struct {
 	backend  backend.Backend
 	logger   Logger
 	listener net.Listener
+	udpConn  *net.UDPConn
+	udpFlows sync.Map // key: string(clientAddr) -> *udpRelay
 	mu       sync.Mutex
+}
+
+// udpRelay tracks a single client's UDP association.
+type udpRelay struct {
+	clientAddr *net.UDPAddr
+	flows      sync.Map // key: string(targetAddr) -> net.Conn (tunnel UDP conn)
+	cancel     context.CancelFunc
 }
 
 // Option configures the Server.
@@ -122,27 +136,47 @@ func WithLogger(l Logger) Option {
 
 // ListenAndServe starts the SOCKS5 server and blocks until the context is cancelled.
 func (s *Server) ListenAndServe(ctx context.Context) error {
-	ln, err := net.Listen("tcp", s.addr)
+	// Use tcp4/udp4 to avoid dual-stack source address mismatch.
+	// IPv6-bound sockets send replies with ::ffff:x.x.x.x source which
+	// IPv4 connected UDP clients reject.
+	ln, err := net.Listen("tcp4", s.addr)
 	if err != nil {
-		return fmt.Errorf("socks5: listen: %w", err)
+		return fmt.Errorf("socks5: listen tcp: %w", err)
+	}
+
+	// Start UDP listener on the same port for UDP ASSOCIATE relay.
+	udpAddr, err := net.ResolveUDPAddr("udp4", s.addr)
+	if err != nil {
+		ln.Close()
+		return fmt.Errorf("socks5: resolve udp addr: %w", err)
+	}
+	udpConn, err := net.ListenUDP("udp4", udpAddr)
+	if err != nil {
+		ln.Close()
+		return fmt.Errorf("socks5: listen udp: %w", err)
 	}
 
 	s.mu.Lock()
 	s.listener = ln
+	s.udpConn = udpConn
 	s.mu.Unlock()
 
-	s.logger.Infof("listening on %s (backend: %s)", ln.Addr(), s.backend.Name())
+	s.logger.Infof("listening on %s TCP+UDP (backend: %s)", ln.Addr(), s.backend.Name())
 	if s.auth != nil {
 		s.logger.Infof("auth enabled: %d credential(s)", s.auth.Count())
 	} else {
 		s.logger.Infof("auth disabled (no authentication)")
 	}
 
-	// Close listener when context is done.
+	// Close listeners when context is done.
 	go func() {
 		<-ctx.Done()
 		ln.Close()
+		udpConn.Close()
 	}()
+
+	// Start UDP relay loop.
+	go s.udpRelayLoop(ctx)
 
 	for {
 		conn, err := ln.Accept()
@@ -174,6 +208,9 @@ func (s *Server) Addr() net.Addr {
 func (s *Server) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.udpConn != nil {
+		s.udpConn.Close()
+	}
 	if s.listener != nil {
 		return s.listener.Close()
 	}
@@ -304,10 +341,7 @@ func (s *Server) handleRequest(ctx context.Context, conn net.Conn, user string) 
 		return fmt.Errorf("bad version: %d", header[0])
 	}
 
-	if header[1] != cmdConnect {
-		s.sendReply(conn, repCmdNotSupported, nil)
-		return fmt.Errorf("unsupported command: %d", header[1])
-	}
+	cmd := header[1]
 
 	// Parse destination address.
 	addr, err := s.readAddr(conn, header[3])
@@ -321,11 +355,30 @@ func (s *Server) handleRequest(ctx context.Context, conn net.Conn, user string) 
 	if user != "" {
 		userInfo = user
 	}
-	s.logger.Infof("[%s] CONNECT %s ← %s", userInfo, addr, conn.RemoteAddr())
 
-	// Connect through backend.
 	conn.SetDeadline(time.Time{}) // clear deadline for relay
 
+	switch cmd {
+	case cmdConnect:
+		s.logger.Infof("[%s] CONNECT %s ← %s", userInfo, addr, conn.RemoteAddr())
+		return s.handleConnect(ctx, conn, addr)
+
+	case cmdUDPAssociate:
+		s.logger.Infof("[%s] UDP ASSOCIATE %s ← %s", userInfo, addr, conn.RemoteAddr())
+		return s.handleUDPAssociate(ctx, conn, addr)
+
+	case cmdBind:
+		s.logger.Infof("[%s] BIND %s ← %s", userInfo, addr, conn.RemoteAddr())
+		return s.handleBind(ctx, conn, addr)
+
+	default:
+		s.sendReply(conn, repCmdNotSupported, nil)
+		return fmt.Errorf("unsupported command: %d", cmd)
+	}
+}
+
+// handleConnect handles SOCKS5 CONNECT command (TCP proxy).
+func (s *Server) handleConnect(ctx context.Context, conn net.Conn, addr string) error {
 	dialCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
@@ -336,13 +389,304 @@ func (s *Server) handleRequest(ctx context.Context, conn net.Conn, user string) 
 	}
 	defer target.Close()
 
-	// Send success reply.
-	localAddr := target.LocalAddr().(*net.TCPAddr)
-	s.sendReply(conn, repSuccess, localAddr)
+	// Send success reply with bound address.
+	if tcpAddr, ok := target.LocalAddr().(*net.TCPAddr); ok {
+		s.sendReply(conn, repSuccess, tcpAddr)
+	} else {
+		s.sendReply(conn, repSuccess, nil)
+	}
 
 	// Bidirectional relay.
 	s.relay(conn, target)
 	return nil
+}
+
+// handleUDPAssociate handles SOCKS5 UDP ASSOCIATE command.
+// It tells the client which UDP address to send datagrams to (our UDP relay),
+// then keeps the TCP control connection open until the client disconnects.
+func (s *Server) handleUDPAssociate(ctx context.Context, conn net.Conn, clientHint string) error {
+	s.mu.Lock()
+	udpConn := s.udpConn
+	s.mu.Unlock()
+
+	if udpConn == nil {
+		s.sendReply(conn, repGeneralFailure, nil)
+		return errors.New("UDP relay not available")
+	}
+
+	// Get the UDP relay address to tell the client.
+	udpAddr := udpConn.LocalAddr().(*net.UDPAddr)
+
+	// Determine the relay IP to send to the client.
+	// If listening on 0.0.0.0, use the TCP connection's local IP instead.
+	relayIP := udpAddr.IP
+	if relayIP.IsUnspecified() {
+		if tcpAddr, ok := conn.LocalAddr().(*net.TCPAddr); ok {
+			relayIP = tcpAddr.IP
+		}
+	}
+
+	bindAddr := &net.TCPAddr{IP: relayIP, Port: udpAddr.Port}
+	s.sendReply(conn, repSuccess, bindAddr)
+
+	s.logger.Infof("UDP ASSOCIATE: relay at %s for client %s", bindAddr, conn.RemoteAddr())
+
+	// Determine expected client UDP address from the hint or TCP remote.
+	clientHost, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
+	clientUDPKey := normalizeIP(clientHost) // Key by normalized client IP
+
+	// Create relay entry for this client.
+	relayCtx, relayCancel := context.WithCancel(ctx)
+	relay := &udpRelay{
+		clientAddr: &net.UDPAddr{IP: net.ParseIP(clientHost)},
+		cancel:     relayCancel,
+	}
+	s.udpFlows.Store(clientUDPKey, relay)
+
+	// Keep the TCP control connection alive.
+	// When it closes, clean up the UDP association.
+	defer func() {
+		relayCancel()
+		// Close all tunnel UDP connections for this relay.
+		relay.flows.Range(func(key, value any) bool {
+			if c, ok := value.(net.Conn); ok {
+				c.Close()
+			}
+			return true
+		})
+		s.udpFlows.Delete(clientUDPKey)
+		s.logger.Infof("UDP ASSOCIATE: cleaned up relay for %s", clientHost)
+	}()
+
+	// Block until TCP control connection closes or context is cancelled.
+	// Per RFC 1928: "A UDP association terminates when the TCP connection
+	// that the UDP ASSOCIATE request arrived at terminates."
+	done := make(chan struct{})
+	go func() {
+		io.Copy(io.Discard, conn)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-relayCtx.Done():
+	}
+	return nil
+}
+
+// handleBind handles SOCKS5 BIND command.
+func (s *Server) handleBind(ctx context.Context, conn net.Conn, addr string) error {
+	// BIND is rarely used (FTP active mode). For now, return not supported
+	// but with proper error instead of crashing.
+	s.sendReply(conn, repCmdNotSupported, nil)
+	return fmt.Errorf("BIND not implemented")
+}
+
+// --- UDP relay ---
+
+// udpRelayLoop reads SOCKS5 UDP datagrams from clients and relays them.
+func (s *Server) udpRelayLoop(ctx context.Context) {
+	buf := make([]byte, maxUDPPacket)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		n, clientAddr, err := s.udpConn.ReadFromUDP(buf)
+		if err != nil {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				s.logger.Errorf("UDP read: %v", err)
+				continue
+			}
+		}
+
+		if n < 4 {
+			continue // too short for SOCKS5 UDP header
+		}
+
+		// Parse SOCKS5 UDP datagram header (RFC 1928 §7).
+		// +----+------+------+----------+----------+----------+
+		// |RSV | FRAG | ATYP | DST.ADDR | DST.PORT |   DATA   |
+		// +----+------+------+----------+----------+----------+
+		// | 2  |  1   |  1   | Variable |    2     | Variable |
+		// +----+------+------+----------+----------+----------+
+		data := make([]byte, n)
+		copy(data, buf[:n])
+
+		// Skip fragments.
+		frag := data[2]
+		if frag != 0x00 {
+			continue
+		}
+
+		// Parse target address.
+		targetAddr, headerLen, err := parseSocks5UDPAddr(data)
+		if err != nil {
+			s.logger.Errorf("UDP parse addr: %v", err)
+			continue
+		}
+
+		payload := data[headerLen:]
+
+		s.logger.Infof("UDP RELAY: %s → %s (%d bytes payload)", clientAddr, targetAddr, len(payload))
+
+		// Find the relay for this client.
+		clientKey := normalizeIP(clientAddr.IP.String())
+		relayVal, ok := s.udpFlows.Load(clientKey)
+		if !ok {
+			s.logger.Errorf("UDP: no association for client %s", clientKey)
+			continue
+		}
+		relay := relayVal.(*udpRelay)
+
+		// Update the client's actual UDP address (port may vary).
+		relay.clientAddr = clientAddr
+
+		// Get or create tunnel connection for this target.
+		var tunnelConn net.Conn
+		if v, ok := relay.flows.Load(targetAddr); ok {
+			tunnelConn = v.(net.Conn)
+		} else {
+			// Dial through the tunnel backend.
+			s.logger.Infof("UDP RELAY: dialing tunnel to %s", targetAddr)
+			dialCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+			tc, err := s.backend.DialContext(dialCtx, "udp", targetAddr)
+			cancel()
+			if err != nil {
+				s.logger.Errorf("UDP tunnel dial %s: %v", targetAddr, err)
+				continue
+			}
+			s.logger.Infof("UDP RELAY: tunnel connected to %s", targetAddr)
+			tunnelConn = tc
+			relay.flows.Store(targetAddr, tunnelConn)
+
+			// Start goroutine to read replies from tunnel and send back to client.
+			go s.udpReplyLoop(ctx, relay, tunnelConn, targetAddr)
+		}
+
+		// Forward payload to tunnel.
+		if _, err := tunnelConn.Write(payload); err != nil {
+			s.logger.Errorf("UDP tunnel write: %v", err)
+			tunnelConn.Close()
+			relay.flows.Delete(targetAddr)
+		} else {
+			s.logger.Infof("UDP RELAY: forwarded %d bytes to %s", len(payload), targetAddr)
+		}
+	}
+}
+
+// udpReplyLoop reads replies from a tunnel UDP connection and sends them
+// back to the SOCKS5 client with proper datagram encapsulation.
+func (s *Server) udpReplyLoop(ctx context.Context, relay *udpRelay, tunnelConn net.Conn, targetAddr string) {
+	defer func() {
+		s.logger.Infof("UDP REPLY: loop ended for %s", targetAddr)
+		tunnelConn.Close()
+		relay.flows.Delete(targetAddr)
+	}()
+
+	s.logger.Infof("UDP REPLY: starting reply loop for %s", targetAddr)
+	buf := make([]byte, maxUDPPacket)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		tunnelConn.SetReadDeadline(time.Now().Add(2 * time.Minute))
+		n, err := tunnelConn.Read(buf)
+		if err != nil {
+			s.logger.Infof("UDP REPLY: read from %s error: %v", targetAddr, err)
+			return
+		}
+
+		s.logger.Infof("UDP REPLY: got %d bytes from %s, sending to client %s", n, targetAddr, relay.clientAddr)
+
+		// Build SOCKS5 UDP datagram response.
+		host, portStr, _ := net.SplitHostPort(targetAddr)
+		port, _ := net.LookupPort("udp", portStr)
+
+		var header []byte
+		header = append(header, 0x00, 0x00, 0x00) // RSV + FRAG
+
+		ip := net.ParseIP(host)
+		if ip4 := ip.To4(); ip4 != nil {
+			header = append(header, atypIPv4)
+			header = append(header, ip4...)
+		} else if ip16 := ip.To16(); ip16 != nil {
+			header = append(header, atypIPv6)
+			header = append(header, ip16...)
+		} else {
+			header = append(header, atypDomain)
+			header = append(header, byte(len(host)))
+			header = append(header, []byte(host)...)
+		}
+
+		portBuf := make([]byte, 2)
+		binary.BigEndian.PutUint16(portBuf, uint16(port))
+		header = append(header, portBuf...)
+
+		// Combine header + payload.
+		datagram := append(header, buf[:n]...)
+
+		if relay.clientAddr != nil {
+			nn, err := s.udpConn.WriteToUDP(datagram, relay.clientAddr)
+			s.logger.Infof("UDP REPLY: sent %d bytes to client %s (err=%v)", nn, relay.clientAddr, err)
+		}
+	}
+}
+
+// parseSocks5UDPAddr parses the target address from a SOCKS5 UDP datagram.
+// Returns the target address string, the total header length, and any error.
+func parseSocks5UDPAddr(data []byte) (string, int, error) {
+	if len(data) < 4 {
+		return "", 0, errors.New("datagram too short")
+	}
+
+	atyp := data[3]
+	offset := 4
+
+	var host string
+	switch atyp {
+	case atypIPv4:
+		if len(data) < offset+4+2 {
+			return "", 0, errors.New("datagram too short for IPv4")
+		}
+		host = net.IP(data[offset : offset+4]).String()
+		offset += 4
+
+	case atypDomain:
+		if len(data) < offset+1 {
+			return "", 0, errors.New("datagram too short for domain length")
+		}
+		domainLen := int(data[offset])
+		offset++
+		if len(data) < offset+domainLen+2 {
+			return "", 0, errors.New("datagram too short for domain")
+		}
+		host = string(data[offset : offset+domainLen])
+		offset += domainLen
+
+	case atypIPv6:
+		if len(data) < offset+16+2 {
+			return "", 0, errors.New("datagram too short for IPv6")
+		}
+		host = net.IP(data[offset : offset+16]).String()
+		offset += 16
+
+	default:
+		return "", 0, fmt.Errorf("unsupported atyp: %d", atyp)
+	}
+
+	port := binary.BigEndian.Uint16(data[offset : offset+2])
+	offset += 2
+
+	return net.JoinHostPort(host, fmt.Sprintf("%d", port)), offset, nil
 }
 
 // readAddr reads the destination address from the SOCKS5 request.
@@ -390,24 +734,57 @@ func (s *Server) readAddr(conn net.Conn, atyp byte) (string, error) {
 }
 
 // sendReply sends a SOCKS5 reply to the client.
-func (s *Server) sendReply(conn net.Conn, rep byte, bindAddr *net.TCPAddr) {
+func (s *Server) sendReply(conn net.Conn, rep byte, bindAddr net.Addr) {
 	// +----+-----+-------+------+----------+----------+
 	// |VER | REP |  RSV  | ATYP | BND.ADDR | BND.PORT |
 	// +----+-----+-------+------+----------+----------+
 
-	reply := []byte{socks5Version, rep, 0x00, atypIPv4}
+	var ip net.IP
+	var port int
 
-	if bindAddr != nil && bindAddr.IP.To4() != nil {
-		reply = append(reply, bindAddr.IP.To4()...)
-		portBuf := make([]byte, 2)
-		binary.BigEndian.PutUint16(portBuf, uint16(bindAddr.Port))
-		reply = append(reply, portBuf...)
-	} else {
-		// Zero address.
-		reply = append(reply, 0, 0, 0, 0, 0, 0)
+	switch a := bindAddr.(type) {
+	case *net.TCPAddr:
+		ip = a.IP
+		port = a.Port
+	case *net.UDPAddr:
+		ip = a.IP
+		port = a.Port
+	default:
+		// nil or unknown — zero address.
 	}
 
-	conn.Write(reply)
+	// Normalize IPv6 to IPv4 when possible:
+	// - ::1 (IPv6 loopback) → 127.0.0.1
+	// - ::ffff:x.x.x.x (IPv4-mapped IPv6) → x.x.x.x
+	if ip != nil {
+		if ip.IsLoopback() {
+			ip = net.IPv4(127, 0, 0, 1)
+		} else if ip4 := ip.To4(); ip4 != nil {
+			ip = ip4
+		}
+	}
+
+	if ip4 := ip.To4(); ip4 != nil {
+		// IPv4
+		reply := []byte{socks5Version, rep, 0x00, atypIPv4}
+		reply = append(reply, ip4...)
+		portBuf := make([]byte, 2)
+		binary.BigEndian.PutUint16(portBuf, uint16(port))
+		reply = append(reply, portBuf...)
+		conn.Write(reply)
+	} else if ip16 := ip.To16(); ip16 != nil {
+		// IPv6
+		reply := []byte{socks5Version, rep, 0x00, atypIPv6}
+		reply = append(reply, ip16...)
+		portBuf := make([]byte, 2)
+		binary.BigEndian.PutUint16(portBuf, uint16(port))
+		reply = append(reply, portBuf...)
+		conn.Write(reply)
+	} else {
+		// Zero address fallback.
+		reply := []byte{socks5Version, rep, 0x00, atypIPv4, 0, 0, 0, 0, 0, 0}
+		conn.Write(reply)
+	}
 }
 
 // relay copies data bidirectionally between two connections.
@@ -432,6 +809,22 @@ func (s *Server) relay(client, target net.Conn) {
 	}()
 
 	wg.Wait()
+}
+
+// normalizeIP converts IPv6 loopback (::1) and IPv4-mapped IPv6
+// addresses to plain IPv4 strings for consistent key matching.
+func normalizeIP(s string) string {
+	ip := net.ParseIP(s)
+	if ip == nil {
+		return s
+	}
+	if ip.IsLoopback() {
+		return "127.0.0.1"
+	}
+	if ip4 := ip.To4(); ip4 != nil {
+		return ip4.String()
+	}
+	return ip.String()
 }
 
 func hasMethod(methods []byte, method byte) bool {

@@ -14,5 +14,5 @@ require (
 
 replace (
 	github.com/galang-rs/ovpn => ../ovpn
-	github.com/galang-rs/wireguard => ../wiregaurd
+	github.com/galang-rs/wireguard => ../wireguard
 )
