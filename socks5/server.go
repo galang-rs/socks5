@@ -543,12 +543,69 @@ func (s *Server) handleUDPAssociate(ctx context.Context, conn net.Conn, clientHi
 	return nil
 }
 
-// handleBind handles SOCKS5 BIND command.
+// handleBind handles SOCKS5 BIND command (RFC 1928 §6).
+// Opens a local TCP listener and waits for an incoming connection,
+// then relays data bidirectionally between the client and the incoming peer.
 func (s *Server) handleBind(ctx context.Context, conn net.Conn, addr string) error {
-	// BIND is rarely used (FTP active mode). For now, return not supported
-	// but with proper error instead of crashing.
-	s.sendReply(conn, repCmdNotSupported, nil)
-	return fmt.Errorf("BIND not implemented")
+	// Listen on a random port on the same IP as the client's TCP connection.
+	listenIP := "0.0.0.0"
+	if tcpAddr, ok := conn.LocalAddr().(*net.TCPAddr); ok && !tcpAddr.IP.IsUnspecified() {
+		listenIP = tcpAddr.IP.String()
+	}
+
+	ln, err := net.Listen("tcp", net.JoinHostPort(listenIP, "0"))
+	if err != nil {
+		s.sendReply(conn, repGeneralFailure, nil)
+		return fmt.Errorf("bind listen: %w", err)
+	}
+	defer ln.Close()
+
+	// First reply: tell client the bound address/port.
+	bindAddr := ln.Addr().(*net.TCPAddr)
+	s.sendReply(conn, repSuccess, bindAddr)
+	s.logger.Infof("BIND: listening on %s for %s", bindAddr, addr)
+
+	// Set accept deadline so we don't wait forever.
+	ln.(*net.TCPListener).SetDeadline(time.Now().Add(60 * time.Second))
+
+	// Force-close listener when context done or client TCP drops.
+	acceptCtx, acceptCancel := context.WithCancel(ctx)
+	defer acceptCancel()
+
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		select {
+		case <-acceptCtx.Done():
+			ln.Close()
+		}
+	}()
+
+	// Also monitor client TCP connection — if it drops, cancel.
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		buf := make([]byte, 1)
+		conn.Read(buf) // blocks until close or data
+		acceptCancel()
+	}()
+
+	// Wait for incoming connection.
+	incoming, err := ln.Accept()
+	if err != nil {
+		s.sendReply(conn, repGeneralFailure, nil)
+		return fmt.Errorf("bind accept: %w", err)
+	}
+	defer incoming.Close()
+
+	// Second reply: tell client who connected.
+	peerAddr := incoming.RemoteAddr().(*net.TCPAddr)
+	s.sendReply(conn, repSuccess, peerAddr)
+	s.logger.Infof("BIND: accepted connection from %s", peerAddr)
+
+	// Bidirectional relay.
+	s.relay(ctx, conn, incoming)
+	return nil
 }
 
 // --- UDP relay ---
@@ -619,36 +676,34 @@ func (s *Server) udpRelayLoop(ctx context.Context) {
 		relay.mu.Unlock()
 
 		// Get or create tunnel connection for this target.
-		var tunnelConn net.Conn
-		if v, ok := relay.flows.Load(targetAddr); ok {
-			tunnelConn = v.(net.Conn)
-		} else {
-			// Dial through the tunnel backend.
-			s.logger.Debugf("UDP RELAY: dialing tunnel to %s", targetAddr)
-			dialCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-			tc, err := s.backend.DialContext(dialCtx, "udp", targetAddr)
-			cancel()
-			if err != nil {
-				s.logger.Errorf("UDP tunnel dial %s: %v", targetAddr, err)
-				continue
-			}
-			s.logger.Debugf("UDP RELAY: tunnel connected to %s", targetAddr)
-			tunnelConn = tc
-			relay.flows.Store(targetAddr, tunnelConn)
-
-			// Start goroutine to read replies from tunnel and send back to client.
-			s.wg.Add(1)
-			go func() {
-				defer s.wg.Done()
-				s.udpReplyLoop(ctx, relay, tunnelConn, targetAddr)
-			}()
+		tunnelConn, isExisting := s.getOrDialUDP(ctx, relay, targetAddr)
+		if tunnelConn == nil {
+			continue
 		}
 
 		// Forward payload to tunnel.
 		if _, err := tunnelConn.Write(payload); err != nil {
-			s.logger.Warnf("UDP tunnel write: %v", err)
+			s.logger.Warnf("UDP tunnel write to %s: %v", targetAddr, err)
 			tunnelConn.Close()
 			relay.flows.Delete(targetAddr)
+
+			// If this was an existing (cached) connection that went dead
+			// (e.g. after WireGuard reconnect), retry with a fresh connection
+			// instead of silently dropping the datagram.
+			if isExisting {
+				s.logger.Infof("UDP RELAY: retrying %s with fresh tunnel connection", targetAddr)
+				tunnelConn, _ = s.getOrDialUDP(ctx, relay, targetAddr)
+				if tunnelConn == nil {
+					continue
+				}
+				if _, err := tunnelConn.Write(payload); err != nil {
+					s.logger.Errorf("UDP tunnel retry write to %s: %v", targetAddr, err)
+					tunnelConn.Close()
+					relay.flows.Delete(targetAddr)
+				} else {
+					s.logger.Debugf("UDP RELAY: retry forwarded %d bytes to %s", len(payload), targetAddr)
+				}
+			}
 		} else {
 			s.logger.Debugf("UDP RELAY: forwarded %d bytes to %s", len(payload), targetAddr)
 		}
@@ -732,6 +787,37 @@ func (s *Server) udpReplyLoop(ctx context.Context, relay *udpRelay, tunnelConn n
 			s.logger.Debugf("UDP REPLY: sent %d bytes to client %s (err=%v)", nn, clientAddr, err)
 		}
 	}
+}
+
+// getOrDialUDP returns an existing tunnel UDP connection for the given target,
+// or dials a new one through the backend. Returns (conn, isExisting).
+// isExisting is true when the connection was already cached in relay.flows.
+// Returns (nil, false) if dialing fails.
+func (s *Server) getOrDialUDP(ctx context.Context, relay *udpRelay, targetAddr string) (net.Conn, bool) {
+	if v, ok := relay.flows.Load(targetAddr); ok {
+		return v.(net.Conn), true
+	}
+
+	// Dial through the tunnel backend.
+	s.logger.Debugf("UDP RELAY: dialing tunnel to %s", targetAddr)
+	dialCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	tc, err := s.backend.DialContext(dialCtx, "udp", targetAddr)
+	cancel()
+	if err != nil {
+		s.logger.Errorf("UDP tunnel dial %s: %v", targetAddr, err)
+		return nil, false
+	}
+	s.logger.Debugf("UDP RELAY: tunnel connected to %s", targetAddr)
+	relay.flows.Store(targetAddr, tc)
+
+	// Start goroutine to read replies from tunnel and send back to client.
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		s.udpReplyLoop(ctx, relay, tc, targetAddr)
+	}()
+
+	return tc, false
 }
 
 // parseSocks5UDPAddr parses the target address from a SOCKS5 UDP datagram.
