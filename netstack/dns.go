@@ -11,6 +11,12 @@ import (
 	"time"
 )
 
+// DNS record types.
+const (
+	dnsTypeA    = 1  // IPv4 address
+	dnsTypeAAAA = 28 // IPv6 address
+)
+
 // Resolver resolves hostnames through the virtual network stack by
 // sending DNS queries as UDP packets through the TUN device.
 type Resolver struct {
@@ -28,14 +34,36 @@ func NewResolver(stack *Stack, dnsServer string) *Resolver {
 	return &Resolver{stack: stack, dnsServer: host}
 }
 
-// Resolve resolves a hostname to an IPv4 address through the tunnel.
+// Resolve resolves a hostname to an IP address through the tunnel.
 // If hostname is already an IP address, it is returned directly.
+// Tries A record first (IPv4), then AAAA record (IPv6) if the stack
+// has an IPv6 address configured and A record resolution fails.
 func (r *Resolver) Resolve(ctx context.Context, hostname string) (net.IP, error) {
 	// Already an IP?
 	if ip := net.ParseIP(hostname); ip != nil {
 		return ip, nil
 	}
 
+	// Try A record (IPv4) first.
+	ip, err := r.resolveType(ctx, hostname, dnsTypeA)
+	if err == nil {
+		return ip, nil
+	}
+
+	// If the stack has IPv6, try AAAA record.
+	if r.stack.HasIPv6() {
+		ip6, err6 := r.resolveType(ctx, hostname, dnsTypeAAAA)
+		if err6 == nil {
+			return ip6, nil
+		}
+		// Return the original A record error since it's more common.
+	}
+
+	return nil, err
+}
+
+// resolveType resolves a hostname using a specific DNS record type (A or AAAA).
+func (r *Resolver) resolveType(ctx context.Context, hostname string, qtype uint16) (net.IP, error) {
 	port := r.stack.allocPort()
 	defer r.stack.freePort(port)
 
@@ -44,7 +72,7 @@ func (r *Resolver) Resolve(ctx context.Context, hostname string) (net.IP, error)
 	defer r.stack.unregisterUDP(port)
 
 	queryID := uint16(rand.Intn(0xffff))
-	query := buildDNSQuery(hostname, queryID)
+	query := buildDNSQuery(hostname, queryID, qtype)
 
 	dstIP := net.ParseIP(r.dnsServer).To4()
 	if dstIP == nil {
@@ -55,8 +83,8 @@ func (r *Resolver) Resolve(ctx context.Context, hostname string) (net.IP, error)
 	ipData := BuildIPPacket(r.stack.localIP, dstIP, ProtoUDP, udpData, r.stack.nextID())
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
-		r.stack.logger.Debugf("DNS: resolve %s attempt %d/%d via %s (srcPort=%d)",
-			hostname, attempt+1, maxRetries, r.dnsServer, port)
+		r.stack.logger.Debugf("DNS: resolve %s (type=%d) attempt %d/%d via %s (srcPort=%d)",
+			hostname, qtype, attempt+1, maxRetries, r.dnsServer, port)
 
 		if err := r.stack.writePacket(ipData); err != nil {
 			return nil, fmt.Errorf("netstack: send DNS query: %w", err)
@@ -66,7 +94,7 @@ func (r *Resolver) Resolve(ctx context.Context, hostname string) (net.IP, error)
 		select {
 		case data := <-replyCh:
 			timer.Stop()
-			ip, err := parseDNSResponse(data, queryID)
+			ip, err := parseDNSResponse(data, queryID, qtype)
 			if err != nil {
 				r.stack.logger.Errorf("DNS: parse response for %s: %v", hostname, err)
 				return nil, fmt.Errorf("netstack: DNS: %w", err)
@@ -86,28 +114,28 @@ func (r *Resolver) Resolve(ctx context.Context, hostname string) (net.IP, error)
 	return nil, fmt.Errorf("netstack: DNS resolution timeout for %s", hostname)
 }
 
-// --- DNS wire format (minimal A record query/response) ---
+// --- DNS wire format ---
 
-// buildDNSQuery builds a DNS query packet for an A record.
-func buildDNSQuery(hostname string, id uint16) []byte {
+// buildDNSQuery builds a DNS query packet for a given record type.
+func buildDNSQuery(hostname string, id uint16, qtype uint16) []byte {
 	// Header: 12 bytes
 	// Question: variable
 	var buf []byte
 
 	// Header
 	header := make([]byte, 12)
-	binary.BigEndian.PutUint16(header[0:2], id)       // ID
-	binary.BigEndian.PutUint16(header[2:4], 0x0100)   // Flags: standard query, recursion desired
-	binary.BigEndian.PutUint16(header[4:6], 1)         // QDCOUNT: 1 question
+	binary.BigEndian.PutUint16(header[0:2], id)     // ID
+	binary.BigEndian.PutUint16(header[2:4], 0x0100) // Flags: standard query, recursion desired
+	binary.BigEndian.PutUint16(header[4:6], 1)      // QDCOUNT: 1 question
 	// ANCOUNT, NSCOUNT, ARCOUNT: 0
 	buf = append(buf, header...)
 
 	// Question: QNAME + QTYPE + QCLASS
 	buf = append(buf, encodeDNSName(hostname)...)
-	qtype := make([]byte, 4)
-	binary.BigEndian.PutUint16(qtype[0:2], 1) // A record
-	binary.BigEndian.PutUint16(qtype[2:4], 1) // IN class
-	buf = append(buf, qtype...)
+	qtypeClass := make([]byte, 4)
+	binary.BigEndian.PutUint16(qtypeClass[0:2], qtype) // A (1) or AAAA (28)
+	binary.BigEndian.PutUint16(qtypeClass[2:4], 1)     // IN class
+	buf = append(buf, qtypeClass...)
 
 	return buf
 }
@@ -125,8 +153,8 @@ func encodeDNSName(name string) []byte {
 	return buf
 }
 
-// parseDNSResponse parses a DNS response and extracts the first A record IP.
-func parseDNSResponse(data []byte, expectedID uint16) (net.IP, error) {
+// parseDNSResponse parses a DNS response and extracts the first matching record IP.
+func parseDNSResponse(data []byte, expectedID uint16, qtype uint16) (net.IP, error) {
 	if len(data) < 12 {
 		return nil, errors.New("DNS response too short")
 	}
@@ -161,7 +189,7 @@ func parseDNSResponse(data []byte, expectedID uint16) (net.IP, error) {
 		offset += 4 // QTYPE + QCLASS
 	}
 
-	// Parse answers.
+	// Parse answers — look for matching record type.
 	for i := 0; i < int(ancount); i++ {
 		var err error
 		offset, err = skipDNSName(data, offset)
@@ -179,7 +207,8 @@ func parseDNSResponse(data []byte, expectedID uint16) (net.IP, error) {
 		rdlength := binary.BigEndian.Uint16(data[offset+8 : offset+10])
 		offset += 10
 
-		if atype == 1 && rdlength == 4 { // A record
+		if atype == dnsTypeA && rdlength == 4 && qtype == dnsTypeA {
+			// A record — IPv4
 			if offset+4 > len(data) {
 				return nil, errors.New("DNS A record data too short")
 			}
@@ -187,10 +216,24 @@ func parseDNSResponse(data []byte, expectedID uint16) (net.IP, error) {
 			return ip, nil
 		}
 
+		if atype == dnsTypeAAAA && rdlength == 16 && qtype == dnsTypeAAAA {
+			// AAAA record — IPv6
+			if offset+16 > len(data) {
+				return nil, errors.New("DNS AAAA record data too short")
+			}
+			ip := make(net.IP, 16)
+			copy(ip, data[offset:offset+16])
+			return ip, nil
+		}
+
 		offset += int(rdlength)
 	}
 
-	return nil, errors.New("DNS: no A record found")
+	typeName := "A"
+	if qtype == dnsTypeAAAA {
+		typeName = "AAAA"
+	}
+	return nil, fmt.Errorf("DNS: no %s record found", typeName)
 }
 
 // skipDNSName skips a DNS name at the given offset, handling compression pointers.

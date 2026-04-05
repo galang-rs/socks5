@@ -17,6 +17,13 @@ const (
 	retryTimeout  = 3 * time.Second
 )
 
+// connKey identifies a virtual TCP connection.
+type connKey struct {
+	localPort  uint16
+	remoteIP   [16]byte
+	remotePort uint16
+}
+
 // VirtualConn is a TCP connection routed through the virtual network stack.
 // It implements net.Conn.
 type VirtualConn struct {
@@ -398,8 +405,8 @@ func (c *VirtualConn) sendPacketLocked(flags uint8, payload []byte) error {
 }
 
 func (c *VirtualConn) key() connKey {
-	var remoteAddr [4]byte
-	copy(remoteAddr[:], c.remoteIP.To4())
+	var remoteAddr [16]byte
+	copy(remoteAddr[:], c.remoteIP.To16())
 	return connKey{
 		localPort:  c.localPort,
 		remoteIP:   remoteAddr,

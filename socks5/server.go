@@ -187,21 +187,18 @@ func WithLogLevel(level LogLevel) Option {
 
 // ListenAndServe starts the SOCKS5 server and blocks until the context is cancelled.
 func (s *Server) ListenAndServe(ctx context.Context) error {
-	// Use tcp4/udp4 to avoid dual-stack source address mismatch.
-	// IPv6-bound sockets send replies with ::ffff:x.x.x.x source which
-	// IPv4 connected UDP clients reject.
-	ln, err := net.Listen("tcp4", s.addr)
+	// Use dual-stack (tcp/udp) to accept both IPv4 and IPv6 clients.
+	ln, err := net.Listen("tcp", s.addr)
 	if err != nil {
 		return fmt.Errorf("socks5: listen tcp: %w", err)
 	}
 
 	// Start UDP listener on the same port for UDP ASSOCIATE relay.
-	udpAddr, err := net.ResolveUDPAddr("udp4", s.addr)
-	if err != nil {
-		ln.Close()
-		return fmt.Errorf("socks5: resolve udp addr: %w", err)
-	}
-	udpConn, err := net.ListenUDP("udp4", udpAddr)
+	// Derive the UDP address from the TCP listener's actual bound address
+	// to ensure both use the same address family (IPv4-only or dual-stack).
+	tcpBound := ln.Addr().(*net.TCPAddr)
+	udpAddr := &net.UDPAddr{IP: tcpBound.IP, Port: tcpBound.Port}
+	udpConn, err := net.ListenUDP("udp", udpAddr)
 	if err != nil {
 		ln.Close()
 		return fmt.Errorf("socks5: listen udp: %w", err)
@@ -849,13 +846,10 @@ func (s *Server) sendReply(conn net.Conn, rep byte, bindAddr net.Addr) {
 		// nil or unknown — zero address.
 	}
 
-	// Normalize IPv6 to IPv4 when possible:
-	// - ::1 (IPv6 loopback) → 127.0.0.1
-	// - ::ffff:x.x.x.x (IPv4-mapped IPv6) → x.x.x.x
+	// Normalize IPv4-mapped IPv6 (::ffff:x.x.x.x) to plain IPv4.
+	// True IPv6 addresses like ::1 are preserved.
 	if ip != nil {
-		if ip.IsLoopback() {
-			ip = net.IPv4(127, 0, 0, 1)
-		} else if ip4 := ip.To4(); ip4 != nil {
+		if ip4 := ip.To4(); ip4 != nil && !ip.Equal(net.IPv6loopback) {
 			ip = ip4
 		}
 	}
@@ -917,17 +911,16 @@ func (s *Server) relay(ctx context.Context, client, target net.Conn) {
 	wg.Wait()
 }
 
-// normalizeIP converts IPv6 loopback (::1) and IPv4-mapped IPv6
-// addresses to plain IPv4 strings for consistent key matching.
+// normalizeIP converts IPv4-mapped IPv6 addresses (::ffff:x.x.x.x) to plain
+// IPv4 strings for consistent key matching. Pure IPv6 addresses like ::1 are
+// preserved as-is to maintain correct address family separation.
 func normalizeIP(s string) string {
 	ip := net.ParseIP(s)
 	if ip == nil {
 		return s
 	}
-	if ip.IsLoopback() {
-		return "127.0.0.1"
-	}
-	if ip4 := ip.To4(); ip4 != nil {
+	// Convert IPv4-mapped IPv6 (::ffff:x.x.x.x) to plain IPv4.
+	if ip4 := ip.To4(); ip4 != nil && !ip.Equal(net.IPv6loopback) {
 		return ip4.String()
 	}
 	return ip.String()

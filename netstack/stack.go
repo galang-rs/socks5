@@ -16,13 +16,6 @@ type TUNDevice interface {
 	Close() error
 }
 
-// connKey identifies a virtual TCP connection.
-type connKey struct {
-	localPort  uint16
-	remoteIP   [4]byte
-	remotePort uint16
-}
-
 // Logger for the stack.
 type Logger interface {
 	Debugf(format string, args ...any)
@@ -40,12 +33,13 @@ func (nopLogger) Errorf(string, ...any) {}
 
 // Stack is a lightweight virtual TCP/IP network stack on top of a TUN device.
 type Stack struct {
-	tun     TUNDevice
-	localIP net.IP
-	gateway net.IP
-	mtu     int
-	dns     []string
-	logger  Logger
+	tun      TUNDevice
+	localIP  net.IP // IPv4 local address
+	localIP6 net.IP // IPv6 local address (nil if not available)
+	gateway  net.IP
+	mtu      int
+	dns      []string
+	logger   Logger
 
 	// TCP connections.
 	connMu sync.RWMutex
@@ -76,12 +70,13 @@ type Stack struct {
 
 // StackConfig holds configuration for creating a Stack.
 type StackConfig struct {
-	TUN     TUNDevice
-	LocalIP string
-	Gateway string
-	MTU     int
-	DNS     []string
-	Logger  Logger
+	TUN      TUNDevice
+	LocalIP  string // IPv4 address (required)
+	LocalIP6 string // IPv6 address (optional, for dual-stack)
+	Gateway  string
+	MTU      int
+	DNS      []string
+	Logger   Logger
 }
 
 // New creates a new virtual network stack on top of a TUN device.
@@ -89,6 +84,16 @@ func New(cfg StackConfig) (*Stack, error) {
 	localIP := net.ParseIP(cfg.LocalIP).To4()
 	if localIP == nil {
 		return nil, fmt.Errorf("netstack: invalid local IP: %s", cfg.LocalIP)
+	}
+
+	// Parse optional IPv6 local address.
+	var localIP6 net.IP
+	if cfg.LocalIP6 != "" {
+		localIP6 = net.ParseIP(cfg.LocalIP6)
+		if localIP6 == nil {
+			return nil, fmt.Errorf("netstack: invalid local IPv6: %s", cfg.LocalIP6)
+		}
+		localIP6 = localIP6.To16()
 	}
 
 	// Gateway is informational — try parsing as IP, resolve hostname, or fallback.
@@ -129,6 +134,7 @@ func New(cfg StackConfig) (*Stack, error) {
 	s := &Stack{
 		tun:         cfg.TUN,
 		localIP:     localIP,
+		localIP6:    localIP6,
 		gateway:     gateway,
 		mtu:         mtu,
 		dns:         dns,
@@ -181,6 +187,20 @@ func (s *Stack) Close() error {
 	return nil
 }
 
+// HasIPv6 returns true if the stack has an IPv6 address configured.
+func (s *Stack) HasIPv6() bool {
+	return s.localIP6 != nil
+}
+
+// localIPFor returns the appropriate local IP for the given remote IP.
+// If remote is IPv6, returns the stack's IPv6 address; otherwise IPv4.
+func (s *Stack) localIPFor(remoteIP net.IP) net.IP {
+	if remoteIP.To4() == nil && s.localIP6 != nil {
+		return s.localIP6
+	}
+	return s.localIP
+}
+
 // DialContext creates a TCP or UDP connection through the tunnel.
 // Hostnames are resolved via DNS through the tunnel.
 func (s *Stack) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -200,21 +220,24 @@ func (s *Stack) DialContext(ctx context.Context, network, addr string) (net.Conn
 		return nil, fmt.Errorf("netstack: resolve %q: %w", host, err)
 	}
 
+	// Determine local IP based on remote address family.
+	localIP := s.localIPFor(remoteIP)
+
 	// Branch based on network type.
 	switch network {
 	case "udp", "udp4", "udp6":
-		return s.dialUDP(ctx, host, remoteIP.To4(), uint16(port))
+		return s.dialUDP(ctx, host, localIP, remoteIP, uint16(port))
 	case "tcp", "tcp4", "tcp6", "":
-		return s.dialTCP(ctx, host, remoteIP.To4(), uint16(port), addr)
+		return s.dialTCP(ctx, host, localIP, remoteIP, uint16(port), addr)
 	default:
 		return nil, fmt.Errorf("netstack: unsupported network %q", network)
 	}
 }
 
 // dialTCP creates a TCP connection through the tunnel.
-func (s *Stack) dialTCP(ctx context.Context, host string, remoteIP net.IP, port uint16, addr string) (net.Conn, error) {
+func (s *Stack) dialTCP(ctx context.Context, host string, localIP, remoteIP net.IP, port uint16, addr string) (net.Conn, error) {
 	localPort := s.allocPort()
-	conn := newVirtualConn(s, s.localIP, localPort, remoteIP, port)
+	conn := newVirtualConn(s, localIP, localPort, remoteIP, port)
 
 	// Register connection for dispatch.
 	s.connMu.Lock()
@@ -237,9 +260,9 @@ func (s *Stack) dialTCP(ctx context.Context, host string, remoteIP net.IP, port 
 // dialUDP creates a UDP connection through the tunnel.
 // No handshake needed — UDP is connectionless. The connection is
 // registered so that reply packets from the remote are delivered.
-func (s *Stack) dialUDP(ctx context.Context, host string, remoteIP net.IP, port uint16) (net.Conn, error) {
+func (s *Stack) dialUDP(ctx context.Context, host string, localIP, remoteIP net.IP, port uint16) (net.Conn, error) {
 	localPort := s.allocPort()
-	conn := newVirtualUDPConn(s, s.localIP, localPort, remoteIP, port)
+	conn := newVirtualUDPConn(s, localIP, localPort, remoteIP, port)
 
 	// Register UDP connection for dispatch.
 	s.udpConnMu.Lock()
@@ -253,8 +276,17 @@ func (s *Stack) dialUDP(ctx context.Context, host string, remoteIP net.IP, port 
 
 // MSS returns the maximum TCP segment size based on MTU.
 func (s *Stack) MSS() int {
-	// MTU - IP header (20) - TCP header (20)
-	mss := s.mtu - ipHeaderLen - tcpHeaderLen
+	return s.MSSFor(false)
+}
+
+// MSSFor returns the maximum TCP segment size for the specified IP version.
+func (s *Stack) MSSFor(isIPv6 bool) int {
+	// MTU - IP header - TCP header (20)
+	hdrLen := ipHeaderLen
+	if isIPv6 {
+		hdrLen = ip6HeaderLen
+	}
+	mss := s.mtu - hdrLen - tcpHeaderLen
 	if mss < 536 {
 		mss = 536 // minimum MSS per RFC 879
 	}
@@ -293,7 +325,7 @@ func (s *Stack) readLoop(ctx context.Context) {
 
 		pkt, err := ParseIPPacket(buf[:n])
 		if err != nil {
-			continue // skip non-IPv4 or malformed
+			continue // skip unsupported or malformed
 		}
 
 		s.dispatch(pkt)
@@ -317,8 +349,8 @@ func (s *Stack) dispatchTCP(pkt *IPPacket) {
 	}
 
 	// Connection key: the source from the packet is the remote.
-	var remoteAddr [4]byte
-	copy(remoteAddr[:], pkt.SrcIP.To4())
+	var remoteAddr [16]byte
+	copy(remoteAddr[:], pkt.SrcIP.To16())
 	key := connKey{
 		localPort:  seg.DstPort,
 		remoteIP:   remoteAddr,
@@ -347,8 +379,8 @@ func (s *Stack) dispatchUDP(pkt *IPPacket) {
 	}
 
 	// 1. Try connected UDP connections first (general-purpose UDP).
-	var srcAddr [4]byte
-	copy(srcAddr[:], pkt.SrcIP.To4())
+	var srcAddr [16]byte
+	copy(srcAddr[:], pkt.SrcIP.To16())
 	udpKey := udpConnKey{
 		localPort:  udpPkt.DstPort,
 		remoteIP:   srcAddr,

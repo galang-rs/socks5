@@ -11,7 +11,7 @@ import (
 // udpConnKey identifies a virtual UDP connection (connected mode).
 type udpConnKey struct {
 	localPort  uint16
-	remoteIP   [4]byte
+	remoteIP   [16]byte
 	remotePort uint16
 }
 
@@ -52,8 +52,8 @@ func newVirtualUDPConn(stack *Stack, localIP net.IP, localPort uint16,
 
 // key returns the connection key for dispatch lookup.
 func (c *VirtualUDPConn) key() udpConnKey {
-	var remoteAddr [4]byte
-	copy(remoteAddr[:], c.remoteIP.To4())
+	var remoteAddr [16]byte
+	copy(remoteAddr[:], c.remoteIP.To16())
 	return udpConnKey{
 		localPort:  c.localPort,
 		remoteIP:   remoteAddr,

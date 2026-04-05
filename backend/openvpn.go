@@ -84,12 +84,13 @@ func NewOpenVPN(ctx context.Context, cfg OpenVPNConfig) (Backend, error) {
 
 	// Create virtual network stack.
 	stack, err := netstack.New(netstack.StackConfig{
-		TUN:     tun,
-		LocalIP: ti.IP,
-		Gateway: ti.GW,
-		MTU:     mtu,
-		DNS:     dns,
-		Logger:  cfg.Logger,
+		TUN:      tun,
+		LocalIP:  ti.IP,
+		LocalIP6: ti.IPv6,
+		Gateway:  ti.GW,
+		MTU:      mtu,
+		DNS:      dns,
+		Logger:   cfg.Logger,
 	})
 	if err != nil {
 		tun.Close()
