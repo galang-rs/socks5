@@ -299,7 +299,7 @@ func (s *Stack) MSSFor(isIPv6 bool) int {
 func (s *Stack) readLoop(ctx context.Context) {
 	defer s.wg.Done()
 
-	buf := make([]byte, s.mtu+100) // extra space for safety
+	buf := make([]byte, 65536) // max IP packet size for safety
 
 	for {
 		select {

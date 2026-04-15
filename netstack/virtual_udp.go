@@ -45,7 +45,7 @@ func newVirtualUDPConn(stack *Stack, localIP net.IP, localPort uint16,
 		localPort:  localPort,
 		remoteIP:   remoteIP,
 		remotePort: remotePort,
-		recvCh:     make(chan []byte, 64), // buffer up to 64 datagrams
+		recvCh:     make(chan []byte, 256), // buffer up to 256 datagrams (larger for game traffic bursts)
 		closeCh:    make(chan struct{}),
 	}
 }

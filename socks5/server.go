@@ -21,6 +21,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -121,23 +122,27 @@ func (l stdLogger) Errorf(format string, args ...any) {
 
 // Server is a SOCKS5 proxy server.
 type Server struct {
-	addr     string
-	auth     *auth.Multi
-	backend  backend.Backend
-	logger   Logger
-	listener net.Listener
-	udpConn  *net.UDPConn
-	udpFlows sync.Map // key: string(clientAddr) -> *udpRelay
-	mu       sync.Mutex
-	wg       sync.WaitGroup // tracks active goroutines for graceful shutdown
+	addr       string
+	auth       *auth.Multi
+	backend    backend.Backend
+	logger     Logger
+	listener   net.Listener
+	udpConn    *net.UDPConn
+	udpFlows   sync.Map // key: "udpIP:port" -> *udpRelay (bound, after first UDP packet)
+	pendingUDP sync.Map // key: unique string  -> *udpRelay (waiting for first UDP packet)
+	mu         sync.Mutex
+	wg         sync.WaitGroup // tracks active goroutines for graceful shutdown
 }
 
 // udpRelay tracks a single client's UDP association.
 type udpRelay struct {
-	mu         sync.Mutex     // protects clientAddr
+	mu         sync.Mutex     // protects clientAddr, boundKey
 	clientAddr *net.UDPAddr
-	flows      sync.Map // key: string(targetAddr) -> net.Conn (tunnel UDP conn)
+	flows      sync.Map   // key: string(targetAddr) -> net.Conn (tunnel UDP conn)
 	cancel     context.CancelFunc
+	pendingKey string     // key in pendingUDP map (set at creation)
+	boundKey   string     // key in udpFlows map (set when first UDP packet arrives)
+	hintIP     string     // normalized IP from TCP remote addr (for matching)
 }
 
 // Option configures the Server.
@@ -187,18 +192,20 @@ func WithLogLevel(level LogLevel) Option {
 
 // ListenAndServe starts the SOCKS5 server and blocks until the context is cancelled.
 func (s *Server) ListenAndServe(ctx context.Context) error {
-	// Use dual-stack (tcp/udp) to accept both IPv4 and IPv6 clients.
-	ln, err := net.Listen("tcp", s.addr)
+	// Explicitly use "tcp4" to ensure IPv4 binding.
+	// This avoids IPv6-only sockets on systems where dual-stack is unreliable,
+	// which causes UDP packets from IPv4 clients to be silently dropped.
+	ln, err := net.Listen("tcp4", s.addr)
 	if err != nil {
 		return fmt.Errorf("socks5: listen tcp: %w", err)
 	}
 
 	// Start UDP listener on the same port for UDP ASSOCIATE relay.
-	// Derive the UDP address from the TCP listener's actual bound address
-	// to ensure both use the same address family (IPv4-only or dual-stack).
+	// Use "udp4" to match the TCP4 listener — ensures IPv4 UDP packets
+	// are always received, regardless of system IPv6 configuration.
 	tcpBound := ln.Addr().(*net.TCPAddr)
 	udpAddr := &net.UDPAddr{IP: tcpBound.IP, Port: tcpBound.Port}
-	udpConn, err := net.ListenUDP("udp", udpAddr)
+	udpConn, err := net.ListenUDP("udp4", udpAddr)
 	if err != nil {
 		ln.Close()
 		return fmt.Errorf("socks5: listen udp: %w", err)
@@ -445,7 +452,8 @@ func (s *Server) handleConnect(ctx context.Context, conn net.Conn, addr string) 
 
 	target, err := s.backend.DialContext(dialCtx, "tcp", addr)
 	if err != nil {
-		s.sendReply(conn, repHostUnreachable, nil)
+		rep := classifyDialError(err)
+		s.sendReply(conn, rep, nil)
 		return fmt.Errorf("dial %s: %w", addr, err)
 	}
 	defer target.Close()
@@ -462,6 +470,7 @@ func (s *Server) handleConnect(ctx context.Context, conn net.Conn, addr string) 
 	return nil
 }
 
+
 // handleUDPAssociate handles SOCKS5 UDP ASSOCIATE command.
 // It tells the client which UDP address to send datagrams to (our UDP relay),
 // then keeps the TCP control connection open until the client disconnects.
@@ -473,6 +482,14 @@ func (s *Server) handleUDPAssociate(ctx context.Context, conn net.Conn, clientHi
 	if udpConn == nil {
 		s.sendReply(conn, repGeneralFailure, nil)
 		return errors.New("UDP relay not available")
+	}
+
+	// Enable TCP keepalive on the control connection to prevent
+	// NAT/firewall from killing this idle connection, which would
+	// terminate the UDP association and break game networking.
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		tcpConn.SetKeepAlive(true)
+		tcpConn.SetKeepAlivePeriod(30 * time.Second)
 	}
 
 	// Get the UDP relay address to tell the client.
@@ -494,18 +511,25 @@ func (s *Server) handleUDPAssociate(ctx context.Context, conn net.Conn, clientHi
 
 	// Determine expected client UDP address from the hint or TCP remote.
 	clientHost, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
-	clientUDPKey := normalizeIP(clientHost) // Key by normalized client IP
+
+	// Use TCP remote addr (IP:port) as unique pending key — this is
+	// unique per TCP connection, so multiple clients don't conflict.
+	pendingKey := conn.RemoteAddr().String()
 
 	// Create relay entry for this client.
 	relayCtx, relayCancel := context.WithCancel(ctx)
 	relay := &udpRelay{
 		clientAddr: &net.UDPAddr{IP: net.ParseIP(clientHost)},
 		cancel:     relayCancel,
+		pendingKey: pendingKey,
+		hintIP:     normalizeIP(clientHost),
 	}
-	s.udpFlows.Store(clientUDPKey, relay)
+	s.pendingUDP.Store(pendingKey, relay)
+
+	s.logger.Infof("UDP ASSOCIATE: registered pending relay %s (hint IP: %s)", pendingKey, relay.hintIP)
 
 	// Keep the TCP control connection alive.
-	// When it closes, clean up the UDP association.
+	// When it closes, clean up the UDP association from both maps.
 	defer func() {
 		relayCancel()
 		// Close all tunnel UDP connections for this relay.
@@ -515,8 +539,16 @@ func (s *Server) handleUDPAssociate(ctx context.Context, conn net.Conn, clientHi
 			}
 			return true
 		})
-		s.udpFlows.Delete(clientUDPKey)
-		s.logger.Infof("UDP ASSOCIATE: cleaned up relay for %s", clientHost)
+		// Remove from pending map.
+		s.pendingUDP.Delete(pendingKey)
+		// Remove from bound flows map.
+		relay.mu.Lock()
+		bk := relay.boundKey
+		relay.mu.Unlock()
+		if bk != "" {
+			s.udpFlows.Delete(bk)
+		}
+		s.logger.Infof("UDP ASSOCIATE: cleaned up relay for %s (bound: %s)", pendingKey, bk)
 	}()
 
 	// Force-close the TCP conn when context is cancelled so io.Copy unblocks.
@@ -661,16 +693,66 @@ func (s *Server) udpRelayLoop(ctx context.Context) {
 
 		s.logger.Debugf("UDP RELAY: %s → %s (%d bytes payload)", clientAddr, targetAddr, len(payload))
 
-		// Find the relay for this client.
-		clientKey := normalizeIP(clientAddr.IP.String())
-		relayVal, ok := s.udpFlows.Load(clientKey)
+		// Find the relay for this client using two-phase lookup.
+		// Phase 1: Fast path — lookup by exact UDP source addr (IP:port).
+		// Phase 2: Slow path — search pending associations for first UDP packet.
+		udpKey := clientAddr.String() // "IP:port" — unique per client
+		incomingIP := normalizeIP(clientAddr.IP.String())
+
+		relayVal, ok := s.udpFlows.Load(udpKey)
 		if !ok {
-			s.logger.Warnf("UDP: no association for client %s", clientKey)
-			continue
+			// Slow path: first UDP packet from this client.
+			// Search pending associations. Prefer IP match, fall back to any pending.
+			var bestRelay *udpRelay
+			var bestKey string
+
+			s.pendingUDP.Range(func(key, value any) bool {
+				r := value.(*udpRelay)
+				r.mu.Lock()
+				alreadyBound := r.boundKey != ""
+				hint := r.hintIP
+				r.mu.Unlock()
+
+				if alreadyBound {
+					return true // skip already-bound relays
+				}
+
+				// First available pending relay.
+				if bestRelay == nil {
+					bestRelay = r
+					bestKey = key.(string)
+				}
+
+				// Prefer a relay whose hint IP matches the UDP source IP.
+				if hint == incomingIP {
+					bestRelay = r
+					bestKey = key.(string)
+					return false // stop: found best match
+				}
+				return true
+			})
+
+			if bestRelay != nil {
+				relayVal = bestRelay
+				ok = true
+
+				// Bind: store in udpFlows by actual UDP source addr for fast future lookups.
+				bestRelay.mu.Lock()
+				bestRelay.boundKey = udpKey
+				bestRelay.mu.Unlock()
+				s.udpFlows.Store(udpKey, bestRelay)
+
+				s.logger.Infof("UDP ASSOCIATE: bound client %s → relay (pending: %s)", udpKey, bestKey)
+			}
+
+			if !ok {
+				s.logger.Warnf("UDP: no association for client %s", udpKey)
+				continue
+			}
 		}
 		relay := relayVal.(*udpRelay)
 
-		// Update the client's actual UDP address (port may vary).
+		// Update the client's actual UDP address.
 		relay.mu.Lock()
 		relay.clientAddr = clientAddr
 		relay.mu.Unlock()
@@ -741,7 +823,7 @@ func (s *Server) udpReplyLoop(ctx context.Context, relay *udpRelay, tunnelConn n
 		default:
 		}
 
-		tunnelConn.SetReadDeadline(time.Now().Add(2 * time.Minute))
+		tunnelConn.SetReadDeadline(time.Now().Add(5 * time.Minute))
 		n, err := tunnelConn.Read(buf)
 		if err != nil {
 			s.logger.Debugf("UDP REPLY: read from %s: %v", targetAddr, err)
@@ -970,6 +1052,13 @@ func (s *Server) relay(ctx context.Context, client, target net.Conn) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	// Enable TCP keepalive on the client connection to detect dead peers
+	// and maintain NAT state for long-lived game connections.
+	if tcpConn, ok := client.(*net.TCPConn); ok {
+		tcpConn.SetKeepAlive(true)
+		tcpConn.SetKeepAlivePeriod(30 * time.Second)
+	}
+
 	var wg sync.WaitGroup
 	wg.Add(3) // 2 copy goroutines + 1 force-close sentinel
 
@@ -1019,4 +1108,51 @@ func hasMethod(methods []byte, method byte) bool {
 		}
 	}
 	return false
+}
+
+// classifyDialError maps a dial error to the most appropriate SOCKS5 reply code.
+func classifyDialError(err error) byte {
+	if err == nil {
+		return repSuccess
+	}
+
+	errStr := err.Error()
+
+	// Check for specific error types.
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return repHostUnreachable // timeout → host unreachable
+	}
+
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		if opErr.Op == "dial" {
+			// Connection refused.
+			if strings.Contains(errStr, "connection refused") ||
+				strings.Contains(errStr, "actively refused") {
+				return repConnRefused
+			}
+			// Network unreachable.
+			if strings.Contains(errStr, "network is unreachable") ||
+				strings.Contains(errStr, "no route to host") {
+				return repNetUnreachable
+			}
+		}
+	}
+
+	// DNS resolution failures.
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return repHostUnreachable
+	}
+
+	// String-based fallbacks for custom netstack errors.
+	if strings.Contains(errStr, "resolve") || strings.Contains(errStr, "DNS") {
+		return repHostUnreachable
+	}
+	if strings.Contains(errStr, "handshake timeout") || strings.Contains(errStr, "connect") {
+		return repHostUnreachable
+	}
+
+	return repGeneralFailure
 }

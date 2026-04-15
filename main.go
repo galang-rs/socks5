@@ -25,8 +25,8 @@ func main() {
 	)
 
 	// Start WireGuard backend
-	be, err := backend.NewWireGuard(ctx, backend.WireGuardConfig{
-		ConfigFile: "wireguard.conf",
+	be, err := backend.NewOpenVPN(ctx, backend.OpenVPNConfig{
+		ConfigFile: "openvpn.ovpn",
 	})
 	if err != nil {
 		log.Fatal(err)
